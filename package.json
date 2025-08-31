@@ -1,13 +1,16 @@
 {
-  "name": "mercury-parser",
-  "version": "1.0.0",
-  "description": "A universal article parser using Mercury.",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "@postlight/mercury-parser": "^2.2.0",
-    "express": "^4.19.2"
-  }
+  "name": "article-parser-service",
+  "version": "1.0.0",
+  "description": "Universal article parser using Mercury Parser",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@postlight/mercury-parser": "^2.2.1",
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
 }
