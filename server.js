@@ -7,6 +7,11 @@ const port = process.env.PORT || 3000;
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
+// Add a simple handler for the root path
+app.get('/', (req, res) => {
+    res.status(200).send('Parser service is running. Use /parse?url= to get started.');
+});
+
 // API endpoint to handle article parsing
 app.get('/parse', async (req, res) => {
     const articleUrl = req.query.url;
