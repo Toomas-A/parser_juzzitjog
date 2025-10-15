@@ -1,6 +1,6 @@
 // index.js
 const express = require('express');
-const Parser = require('@postlight/parser'); // Новый основной парсер
+const Parser = require('@postlight/parser');
 const { htmlToText } = require('html-to-text');
 const axios = require('axios');
 const fs = require('fs');
@@ -13,20 +13,20 @@ const { Readability } = require('@mozilla/readability');
 let puppeteer = null;
 let StealthPlugin, AnonymizeUAPlugin, UserDataDirPlugin, UserPreferencesPlugin;
 
-// === Feature flags (через Render Env) ===
-const SAFE_MODE = process.env.PARSER_SAFE_MODE === '1';                   // 1 = старое поведение (без AMP/Readability/кастом-правил)
-const ENABLE_AMP = process.env.PARSER_ENABLE_AMP !== '0';                 // 1 по умолчанию
-const ENABLE_READABILITY = process.env.PARSER_ENABLE_READABILITY !== '0'; // 1 по умолчанию
-const ENABLE_PUPPETEER = process.env.PARSER_ENABLE_PUPPETEER === '1';     // 0 по умолчанию
-const WORDCOUNT_MIN = Number(process.env.PARSER_WORDCOUNT_MIN || 800);    // порог "короткого" текста
-const ENABLE_INTRO_RECOVERY = process.env.PARSER_RECOVER_INTRO !== '0';   // 1 по умолчанию
+// === Feature flags ===
+const SAFE_MODE = process.env.PARSER_SAFE_MODE === '1';
+const ENABLE_AMP = process.env.PARSER_ENABLE_AMP !== '0';
+const ENABLE_READABILITY = process.env.PARSER_ENABLE_READABILITY !== '0';
+const ENABLE_PUPPETEER = process.env.PARSER_ENABLE_PUPPETEER === '1';
+const WORDCOUNT_MIN = Number(process.env.PARSER_WORDCOUNT_MIN || 800);
+const ENABLE_INTRO_RECOVERY = process.env.PARSER_RECOVER_INTRO !== '0';
+const ENABLE_CARD_HEADERS_RECOVERY = process.env.PARSER_RECOVER_CARD_HEADERS !== '0'; // <— НОВОЕ
 
-// Регистрируем кастомный экстрактор для Runner's World
+// Кастомный экстрактор Runner's World
 try {
   const rwRule = require('./rules/www.runnersworld.com.js');
   Parser.addExtractor(rwRule);
 } catch (e) {
-  // если файла нет — просто продолжаем
   console.log('Custom extractor not loaded (optional):', e.message);
 }
 
@@ -48,7 +48,7 @@ app.use((_, res, next) => {
   next();
 });
 
-// Логи в файлы + консоль
+// Логи
 console.log = (...args) => {
   const message = args.join(' ');
   fs.appendFileSync('parser.log', `${new Date().toISOString()} - ${message}\n`, 'utf8');
@@ -118,7 +118,7 @@ function readabilityFallback(url, html) {
   return { title: article.title, content: article.content };
 }
 
-// --- Intro recovery: из сырого HTML берём лид/абзацы до первого H2/H3 и добавляем в начало ---
+// --- Intro recovery ---
 function extractIntroHTML(rawHtml, urlForDom) {
   try {
     const dom = new JSDOM(rawHtml, { url: urlForDom });
@@ -130,7 +130,6 @@ function extractIntroHTML(rawHtml, urlForDom) {
 
     const collected = [];
 
-    // явные lede/dek
     const lede = root.querySelector('.content-lede, .article-dek, .dek, .intro, .content-info, .css-lede, .css-dek');
     if (lede) {
       lede.querySelectorAll('p').forEach(p => {
@@ -139,7 +138,6 @@ function extractIntroHTML(rawHtml, urlForDom) {
       });
     }
 
-    // абзацы до первого подзаголовка
     const firstSubhead = root.querySelector('h2, h3');
     const walker = doc.createTreeWalker(root, dom.window.NodeFilter.SHOW_ELEMENT, null);
     let el;
@@ -151,7 +149,6 @@ function extractIntroHTML(rawHtml, urlForDom) {
       }
     }
 
-    // уникализация
     const uniq = [];
     const seen = new Set();
     for (const html of collected) {
@@ -164,171 +161,213 @@ function extractIntroHTML(rawHtml, urlForDom) {
   }
 }
 
+// --- Card header recovery (badge + title + price) ---
+function extractFirstCardMeta(rawHtml, urlForDom) {
+  try {
+    const dom = new JSDOM(rawHtml, { url: urlForDom });
+    const doc = dom.window.document;
+
+    const root =
+      doc.querySelector('main article, article, [itemprop="articleBody"], [data-article-body], .content article, .content') ||
+      doc.body;
+
+    // Найдём маркер «Our Full Running Gloves Reviews»
+    let seenMarker = false;
+    const isMarker = (txt) => /our full .*running .*gloves .*reviews/i.test(txt);
+
+    // Пройдём документ в порядке следования
+    const walker = doc.createTreeWalker(root, dom.window.NodeFilter.SHOW_ELEMENT, null);
+    let el, titleNode = null, titleText = '';
+    while ((el = walker.nextNode())) {
+      const txt = (el.textContent || '').trim();
+      if (!seenMarker && txt && isMarker(txt)) {
+        seenMarker = true;
+        continue;
+      }
+      if (seenMarker && (el.tagName === 'H2' || el.tagName === 'H3')) {
+        const t = (el.textContent || '').trim();
+        if (t && t.length >= 8 && t.length <= 160) {
+          titleNode = el;
+          titleText = t;
+          break;
+        }
+      }
+    }
+    if (!titleNode) return null;
+
+    // Ищем бейдж и цену "рядом" с заголовком (в пределах нескольких соседей / того же контейнера)
+    const container = titleNode.parentElement || root;
+    const neighborhood = [];
+    // соберём текст ближайших 12 соседей (в обе стороны)
+    const siblings = Array.from(container.childNodes);
+    const idx = siblings.indexOf(titleNode);
+    const from = Math.max(0, idx - 8);
+    const to = Math.min(siblings.length, idx + 9);
+    for (let i = from; i < to; i++) {
+      if (siblings[i].textContent) neighborhood.push(siblings[i].textContent);
+    }
+    // плюс немного текста снизу по DOM (следующие несколько элементов)
+    let step = 0, cursor = titleNode;
+    while (cursor && step < 10) {
+      cursor = cursor.nextElementSibling;
+      if (cursor && cursor.textContent) neighborhood.push(cursor.textContent);
+      step++;
+    }
+
+    const joined = neighborhood.join(' \n ').replace(/\s+/g, ' ').trim();
+
+    const badgeMatch = joined.match(/\b(Best\s+(?:Overall|Budget|Value|for [^,.;]+)|Editor'?s Choice|Top Pick)\b/i);
+    const badge = badgeMatch ? badgeMatch[0] : '';
+
+    // Цена + возможный ритейлер
+    const priceMatch = joined.match(/\$\s*\d{1,4}(?:[\.,]\d{2})?/);
+    let priceLine = priceMatch ? priceMatch[0] : '';
+    if (priceLine) {
+      const retailerMatch = joined.match(/\b(Backcountry|Amazon|REI|Nike|Adidas|New Balance|Zappos|Running Warehouse)\b/i);
+      if (retailerMatch) priceLine = `${priceLine} ${retailerMatch[0]}`;
+    }
+
+    return {
+      badge: badge || '',
+      title: titleText || '',
+      price: priceLine || ''
+    };
+  } catch (e) {
+    console.log('extractFirstCardMeta failed:', e.message);
+    return null;
+  }
+}
+
+function injectFirstCardHeaderIntoContent(contentHTML, meta) {
+  if (!meta || !(meta.badge || meta.title || meta.price)) return contentHTML;
+
+  const frag = [
+    meta.badge ? `<p><strong>${meta.badge}</strong></p>` : '',
+    meta.title ? `<h3>${meta.title}</h3>` : '',
+    meta.price ? `<p>${meta.price}</p>` : ''
+  ].join('');
+
+  try {
+    const dom = new JSDOM(`<div id="__root">${contentHTML}</div>`);
+    const doc = dom.window.document;
+    const root = doc.getElementById('__root');
+
+    // Ищем маркер секции обзоров
+    let markerEl = null;
+    const all = root.querySelectorAll('*');
+    for (const el of all) {
+      const txt = (el.textContent || '').trim();
+      if (txt && /our full .*running .*gloves .*reviews/i.test(txt)) {
+        markerEl = el;
+        break;
+      }
+    }
+
+    // Если в тексте уже есть заголовок/бейдж/цена — не дублируем
+    const plain = root.textContent.replace(/\s+/g, ' ');
+    if (meta.title && plain.includes(meta.title)) {
+      console.log('Card title already present — skip inject.');
+      return contentHTML;
+    }
+
+    if (markerEl) {
+      markerEl.insertAdjacentHTML('afterend', frag);
+      console.log('Inserted card header after marker.');
+    } else {
+      root.insertAdjacentHTML('afterbegin', frag);
+      console.log('Inserted card header at beginning (marker not found).');
+    }
+    return root.innerHTML;
+  } catch (e) {
+    console.log('injectFirstCardHeaderIntoContent failed:', e.message);
+    // если не удалось — просто припрячем в начало
+    return frag + contentHTML;
+  }
+}
+
 // --- Эндпоинт ---
 app.get('/parse', async (req, res) => {
   let url = req.query.url;
   if (!url) return res.status(400).json({ error: 'URL is required' });
 
   let result = null;
-  let author = 'N/A';
 
   try {
-    // 1) Базовый парс (по финальному URL и исходному HTML)
+    // 1) Базовый парс
     const fetched = await fetchWithRetry(url, { headers: {} });
     url = fetched.finalUrl;
     console.log(`Parse start for: ${url}`);
     result = await parseWithPostlight(url, fetched.body);
 
-    // 2) Безопасный режим: выдаём как есть
     if (!SAFE_MODE) {
       const isHearst = HEARST_DOMAINS.has(new URL(url).hostname);
       const tooShort = !result?.content || wordCountFromHtml(result.content) < WORDCOUNT_MIN;
 
-      // 2a) AMP
       if (ENABLE_AMP && (isHearst || tooShort)) {
         try {
           const amp = await tryAmp(url);
           if (amp?.content && wordCountFromHtml(amp.content) > wordCountFromHtml(result?.content || '')) {
-            console.log('AMP version chosen (better content).');
+            console.log('AMP version chosen.');
             result = amp;
           }
-        } catch (e) {
-          console.log('AMP fallback failed:', e.message);
-        }
+        } catch (e) { console.log('AMP fallback failed:', e.message); }
       }
 
-      // 2b) Readability
       if (ENABLE_READABILITY && wordCountFromHtml(result?.content || '') < WORDCOUNT_MIN) {
         try {
-          const html = fetched.body; // уже есть исходный HTML
-          const rb = readabilityFallback(url, html);
+          const rb = readabilityFallback(url, fetched.body);
           if (rb?.content && wordCountFromHtml(rb.content) > wordCountFromHtml(result?.content || '')) {
-            console.log('Readability fallback chosen (better content).');
+            console.log('Readability fallback chosen.');
             result = { ...result, title: rb.title || result?.title, content: rb.content };
           }
-        } catch (e) {
-          console.log('Readability fallback failed:', e.message);
-        }
-      }
-
-      // 2c) Тяжёлый Puppeteer — только по явному флагу
-      if (ENABLE_PUPPETEER && wordCountFromHtml(result?.content || '') < WORDCOUNT_MIN) {
-        try {
-          if (!puppeteer) {
-            puppeteer = require('puppeteer-extra');
-            StealthPlugin = require('puppeteer-extra-plugin-stealth');
-            AnonymizeUAPlugin = require('puppeteer-extra-plugin-anonymize-ua');
-            UserDataDirPlugin = require('puppeteer-extra-plugin-user-data-dir');
-            UserPreferencesPlugin = require('puppeteer-extra-plugin-user-preferences');
-            puppeteer.use(StealthPlugin());
-            puppeteer.use(AnonymizeUAPlugin());
-            puppeteer.use(UserDataDirPlugin());
-            puppeteer.use(
-              UserPreferencesPlugin({
-                userPrefs: {
-                  'intl.accept_languages': 'en-US,en',
-                  'webrtc.ip_handling_policy': 'disable_non_proxied_udp',
-                  'webrtc.multiple_routes_enabled': false,
-                  'webrtc.enabled': false,
-                  'privacy.sandbox.enabled': false,
-                  'enable_do_not_track': 1,
-                },
-              })
-            );
-          }
-
-          console.log('Starting heavy Puppeteer fallback...');
-          const browser = await puppeteer.launch({
-            headless: false,
-            args: [
-              '--no-sandbox',
-              '--disable-setuid-sandbox',
-              '--disable-dev-shm-usage',
-              '--disable-gpu',
-              '--window-size=1920,1080',
-              '--disable-web-security',
-              '--disable-features=IsolateOrigins,site-per-process',
-              '--blink-settings=imagesEnabled=false',
-              '--no-zygote',
-              '--disable-accelerated-2d-canvas',
-              '--disable-background-networking',
-              '--enable-features=NetworkService,NetworkServiceInProcess',
-              '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
-            ],
-          });
-          const page = await browser.newPage();
-          await page.setViewport({ width: 1920, height: 1080, deviceScaleFactor: 1 });
-          await page.setRequestInterception(true);
-          page.on('request', r => {
-            const t = r.resourceType();
-            if (['image', 'media', 'font', 'stylesheet'].includes(t)) r.abort();
-            else r.continue();
-          });
-
-          await page.goto(url, { waitUntil: 'networkidle0', timeout: 600000 });
-          const html = await page.content();
-          await browser.close();
-
-          const heavyParsed = await parseWithPostlight(url, html);
-          if (heavyParsed?.content && wordCountFromHtml(heavyParsed.content) > wordCountFromHtml(result?.content || '')) {
-            console.log('Puppeteer fallback chosen (better content).');
-            result = heavyParsed;
-          }
-        } catch (e) {
-          console.log('Puppeteer fallback failed:', e.message);
-        }
+        } catch (e) { console.log('Readability fallback failed:', e.message); }
       }
     }
-
-    // --- Восстановление вступления (intro) перед конвертацией HTML→text ---
-    if (ENABLE_INTRO_RECOVERY) {
-      try {
-        const introHTML = extractIntroHTML(fetched.body, url);
-        if (introHTML) {
-          const haveIntroAlready =
-            result?.content &&
-            result.content.replace(/\s+/g, ' ').includes(introHTML.replace(/\s+/g, ' ').slice(0, 80));
-          if (!haveIntroAlready) {
-            console.log('Intro recovered and prepended to article.');
-            result.content = introHTML + '\n' + (result.content || '');
-          } else {
-            console.log('Intro already present — no prepend.');
-          }
-        } else {
-          console.log('No intro detected.');
-        }
-      } catch (e) {
-        console.log('Intro recovery failed:', e.message);
-      }
-    }
-
-    // Автор (если вернул парсер)
-    const authorFromParser = result?.author || 'N/A';
-    const author = authorFromParser;
 
     if (!result?.content) {
       return res.status(200).json({
         message: 'No main content extracted, but other data available.',
         fullResult: result,
-        possibleIssues: 'Non-standard layout or protection. Try enabling AMP/Readability/Puppeteer fallbacks.',
+        possibleIssues: 'Non-standard layout or protection.',
       });
     }
 
-    // Санитайз HTML → text (оставляем вашу логику)
+    // --- Восстановление Intro ---
+    if (ENABLE_INTRO_RECOVERY) {
+      try {
+        const introHTML = extractIntroHTML(fetched.body, url);
+        if (introHTML) {
+          const haveIntroAlready =
+            result.content && result.content.replace(/\s+/g, ' ').includes(introHTML.replace(/\s+/g, ' ').slice(0, 80));
+          if (!haveIntroAlready) {
+            result.content = introHTML + '\n' + (result.content || '');
+            console.log('Intro prepended.');
+          }
+        }
+      } catch (e) { console.log('Intro recovery failed:', e.message); }
+    }
+
+    // --- Восстановление шапки первой карточки (бейдж/название/цена) ---
+    if (ENABLE_CARD_HEADERS_RECOVERY) {
+      try {
+        const meta = extractFirstCardMeta(fetched.body, url);
+        if (meta) {
+          result.content = injectFirstCardHeaderIntoContent(result.content, meta);
+        }
+      } catch (e) { console.log('Card header recovery failed:', e.message); }
+    }
+
+    // Автор
+    const author = result?.author || 'N/A';
+
+    // Санитайз HTML → text
     const cleanHtml = result.content
       .replace(/[\u0019\u2018\u2019]/g, "'")
       .replace(/[\u0014-\u001F\u007F-\u009F]/g, '')
       .replace(/[\u2013\u2014]/g, '-')
       .replace(/&#xA0;/g, ' ')
       .replace(/&[#A-Za-z0-9]+;/g, (match) => {
-        const entities = {
-          '&amp;': '&',
-          '&quot;': '"',
-          '&apos;': "'",
-          '&nbsp;': ' ',
-          '&lt;': '<',
-          '&gt;': '>',
-        };
+        const entities = { '&amp;': '&', '&quot;': '"', '&apos;': "'", '&nbsp;': ' ', '&lt;': '<', '&gt;': '>' };
         return entities[match] || '';
       });
 
@@ -347,11 +386,11 @@ app.get('/parse', async (req, res) => {
         { selector: '.advertisement', format: 'skip' },
         { selector: '.related-posts', format: 'skip' },
         { selector: '.comments', format: 'skip' },
-        { selector: '.article-card', format: 'skip' },
-        { selector: '.news-text', format: 'skip' },
-        { selector: '.custom-card', format: 'skip' },
-        { selector: '.section.article-grid', format: 'skip' },
-        { selector: '.container.color-dark-gray', format: 'skip' },
+        // важно: карточки не скрываем
+        // { selector: '.article-card', format: 'skip' },
+        // { selector: '.custom-card', format: 'skip' },
+        // { selector: '.section.article-grid', format: 'skip' },
+        // { selector: '.container.color-dark-gray', format: 'skip' },
       ],
     });
 
@@ -360,8 +399,17 @@ app.get('/parse', async (req, res) => {
       .map((line) => line.trim())
       .filter((line) => {
         if (line.length === 0) return false;
-        if (line.match(/^\d+\.\s*$/)) return false;
-        if (line.match(/newsletter|subscribe|buy now|check price|available at|pick up.*for\s*\$\d+|compare prices|shop the shoe|read article|leave a reply|your email address|comments|authors|shoe size|fav\. distance|prs|previous post|next post|custom-card|podcast|section\.article-grid|notifications/i)) return false;
+        if (/^\d+\.\s*$/.test(line)) return false;
+
+        // Сохраняем цену/бейджи/названия
+        const hasPrice = /\$\s*\d{1,4}(?:[\.,]\d{2})?/.test(line);
+        const hasBadge = /\b(Best|Top|Editor'?s Choice|Overall|Budget|Value)\b/i.test(line);
+        if (hasPrice || hasBadge) return true;
+
+        // Вырубим только явные CTA без цены
+        if (/newsletter|subscribe|read article|leave a reply|your email address|previous post|next post|notifications/i.test(line)) return false;
+        if (/(compare prices|shop the shoe|available at|buy now)/i.test(line) && !hasPrice) return false;
+
         return true;
       })
       .join('\n\n')
