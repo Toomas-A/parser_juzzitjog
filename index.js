@@ -314,7 +314,7 @@ app.get('/parse', async (req, res) => {
       });
     }
 
-    // Санитайз HTML → text (оставляем вашу логику)
+    // Санитайз HTML → text (НЕ удаляем карточки со званиями/ценами)
     const cleanHtml = result.content
       .replace(/[\u0019\u2018\u2019]/g, "'")
       .replace(/[\u0014-\u001F\u007F-\u009F]/g, '')
@@ -347,11 +347,11 @@ app.get('/parse', async (req, res) => {
         { selector: '.advertisement', format: 'skip' },
         { selector: '.related-posts', format: 'skip' },
         { selector: '.comments', format: 'skip' },
-        { selector: '.article-card', format: 'skip' },
-        { selector: '.news-text', format: 'skip' },
-        { selector: '.custom-card', format: 'skip' },
-        { selector: '.section.article-grid', format: 'skip' },
-        { selector: '.container.color-dark-gray', format: 'skip' },
+        // ВАЖНО: карточки/гриды не скрываем — там заголовки/бейджи/цены
+        // { selector: '.article-card', format: 'skip' },
+        // { selector: '.custom-card', format: 'skip' },
+        // { selector: '.section.article-grid', format: 'skip' },
+        // { selector: '.container.color-dark-gray', format: 'skip' },
       ],
     });
 
@@ -360,8 +360,17 @@ app.get('/parse', async (req, res) => {
       .map((line) => line.trim())
       .filter((line) => {
         if (line.length === 0) return false;
-        if (line.match(/^\d+\.\s*$/)) return false;
-        if (line.match(/newsletter|subscribe|buy now|check price|available at|pick up.*for\s*\$\d+|compare prices|shop the shoe|read article|leave a reply|your email address|comments|authors|shoe size|fav\. distance|prs|previous post|next post|custom-card|podcast|section\.article-grid|notifications/i)) return false;
+        if (/^\d+\.\s*$/.test(line)) return false;
+
+        // ВАЖНО: сохраняем цену и бейджи (Best Overall и т.п.)
+        const hasPrice = /\$\s*\d{1,4}(?:[\.,]\d{2})?/.test(line);
+        const hasBadge = /\b(Best|Top|Editor'?s Choice|Overall|Budget|Value)\b/i.test(line);
+        if (hasPrice || hasBadge) return true;
+
+        // Удаляем только явные CTA/хвосты БЕЗ цены
+        if (/newsletter|subscribe|read article|leave a reply|your email address|previous post|next post|notifications/i.test(line)) return false;
+        if (/(compare prices|shop the shoe|available at|buy now)/i.test(line) && !hasPrice) return false;
+
         return true;
       })
       .join('\n\n')
