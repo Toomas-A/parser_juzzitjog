@@ -14,12 +14,11 @@ let puppeteer = null;
 let StealthPlugin, AnonymizeUAPlugin, UserDataDirPlugin, UserPreferencesPlugin;
 
 // === Feature flags (через Render Env) ===
-const SAFE_MODE = process.env.PARSER_SAFE_MODE === '1';                   // 1 = старое поведение (без AMP/Readability/кастом-правил)
-const ENABLE_AMP = process.env.PARSER_ENABLE_AMP !== '0';                 // 1 по умолчанию
-const ENABLE_READABILITY = process.env.PARSER_ENABLE_READABILITY !== '0'; // 1 по умолчанию
-const ENABLE_PUPPETEER = process.env.PARSER_ENABLE_PUPPETEER === '1';     // 0 по умолчанию
-const WORDCOUNT_MIN = Number(process.env.PARSER_WORDCOUNT_MIN || 800);    // порог "короткого" текста
-const ENABLE_INTRO_RECOVERY = process.env.PARSER_RECOVER_INTRO !== '0';   // 1 по умолчанию
+const SAFE_MODE = process.env.PARSER_SAFE_MODE === '1';                  // 1 = старое поведение (без AMP/Readability/кастом-правил)
+const ENABLE_AMP = process.env.PARSER_ENABLE_AMP !== '0';                // 1 по умолчанию
+const ENABLE_READABILITY = process.env.PARSER_ENABLE_READABILITY !== '0';// 1 по умолчанию
+const ENABLE_PUPPETEER = process.env.PARSER_ENABLE_PUPPETEER === '1';    // 0 по умолчанию
+const WORDCOUNT_MIN = Number(process.env.PARSER_WORDCOUNT_MIN || 800);   // порог "короткого" текста
 
 // Регистрируем кастомный экстрактор для Runner's World
 try {
@@ -116,52 +115,6 @@ function readabilityFallback(url, html) {
   const article = reader.parse();
   if (!article) return null;
   return { title: article.title, content: article.content };
-}
-
-// --- Intro recovery: из сырого HTML берём лид/абзацы до первого H2/H3 и добавляем в начало ---
-function extractIntroHTML(rawHtml, urlForDom) {
-  try {
-    const dom = new JSDOM(rawHtml, { url: urlForDom });
-    const doc = dom.window.document;
-
-    const root =
-      doc.querySelector('main article, article, [itemprop="articleBody"], [data-article-body], .content article, .content') ||
-      doc.body;
-
-    const collected = [];
-
-    // явные lede/dek
-    const lede = root.querySelector('.content-lede, .article-dek, .dek, .intro, .content-info, .css-lede, .css-dek');
-    if (lede) {
-      lede.querySelectorAll('p').forEach(p => {
-        const t = p.textContent.trim();
-        if (t.length > 40) collected.push(`<p>${p.innerHTML}</p>`);
-      });
-    }
-
-    // абзацы до первого подзаголовка
-    const firstSubhead = root.querySelector('h2, h3');
-    const walker = doc.createTreeWalker(root, dom.window.NodeFilter.SHOW_ELEMENT, null);
-    let el;
-    while ((el = walker.nextNode())) {
-      if (el === firstSubhead) break;
-      if (el.tagName === 'P') {
-        const t = el.textContent.trim();
-        if (t.length > 40) collected.push(`<p>${el.innerHTML}</p>`);
-      }
-    }
-
-    // уникализация
-    const uniq = [];
-    const seen = new Set();
-    for (const html of collected) {
-      const key = html.replace(/\s+/g, ' ').slice(0, 120);
-      if (!seen.has(key)) { seen.add(key); uniq.push(html); }
-    }
-    return uniq.join('');
-  } catch {
-    return '';
-  }
 }
 
 // --- Эндпоинт ---
@@ -280,31 +233,8 @@ app.get('/parse', async (req, res) => {
       }
     }
 
-    // --- Восстановление вступления (intro) перед конвертацией HTML→text ---
-    if (ENABLE_INTRO_RECOVERY) {
-      try {
-        const introHTML = extractIntroHTML(fetched.body, url);
-        if (introHTML) {
-          const haveIntroAlready =
-            result?.content &&
-            result.content.replace(/\s+/g, ' ').includes(introHTML.replace(/\s+/g, ' ').slice(0, 80));
-          if (!haveIntroAlready) {
-            console.log('Intro recovered and prepended to article.');
-            result.content = introHTML + '\n' + (result.content || '');
-          } else {
-            console.log('Intro already present — no prepend.');
-          }
-        } else {
-          console.log('No intro detected.');
-        }
-      } catch (e) {
-        console.log('Intro recovery failed:', e.message);
-      }
-    }
-
     // Автор (если вернул парсер)
-    const authorFromParser = result?.author || 'N/A';
-    const author = authorFromParser;
+    author = result?.author || 'N/A';
 
     if (!result?.content) {
       return res.status(200).json({
