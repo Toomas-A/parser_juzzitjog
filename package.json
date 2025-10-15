@@ -4,8 +4,10 @@
   "scripts": {
     "start": "node index.js"
   },
+  "engines": {
+    "node": ">=18.17"
+  },
   "dependencies": {
-    "@postlight/mercury-parser": "^2.2.1",
     "express": "^4.21.1",
     "html-to-text": "^8.2.0",
     "axios": "^1.7.7",
@@ -14,7 +16,11 @@
     "puppeteer-extra-plugin-anonymize-ua": "^2.2.14",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "puppeteer-extra-plugin-user-data-dir": "^2.4.1",
-    "puppeteer-extra-plugin-user-preferences": "^2.4.1"
+    "puppeteer-extra-plugin-user-preferences": "^2.4.1",
+    "@postlight/parser": "^2.2.3",
+    "@mozilla/readability": "^0.5.0",
+    "jsdom": "^23.0.0",
+    "node-fetch": "^2.6.11"
   },
   "resolutions": {
     "tough-cookie": "^4.1.3",
