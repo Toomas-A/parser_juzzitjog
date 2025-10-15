@@ -20,7 +20,7 @@ const ENABLE_READABILITY = process.env.PARSER_ENABLE_READABILITY !== '0';
 const ENABLE_PUPPETEER = process.env.PARSER_ENABLE_PUPPETEER === '1';
 const WORDCOUNT_MIN = Number(process.env.PARSER_WORDCOUNT_MIN || 800);
 const ENABLE_INTRO_RECOVERY = process.env.PARSER_RECOVER_INTRO !== '0';
-const ENABLE_CARD_HEADERS_RECOVERY = process.env.PARSER_RECOVER_CARD_HEADERS !== '0'; // по умолчанию 1
+const ENABLE_CARD_HEADERS_RECOVERY = process.env.PARSER_RECOVER_CARD_HEADERS !== '0'; // 1 по умолчанию
 
 // Кастомный экстрактор Runner's World
 try {
@@ -161,89 +161,95 @@ function extractIntroHTML(rawHtml, urlForDom) {
   }
 }
 
-// --- Card header recovery (усовершенствовано) ---
-function extractFirstCardMeta(rawHtml, urlForDom) {
-  try {
-    const dom = new JSDOM(rawHtml, { url: urlForDom });
-    const doc = dom.window.document;
+// --- Card header recovery (DOM + Regex fallback) ---
+function extractFirstCardMeta_DOM(rawHtml, urlForDom) {
+  const dom = new JSDOM(rawHtml, { url: urlForDom });
+  const doc = dom.window.document;
 
-    const root =
-      doc.querySelector('main article, article, [itemprop="articleBody"], [data-article-body], .content article, .content') ||
-      doc.body;
+  const root =
+    doc.querySelector('main article, article, [itemprop="articleBody"], [data-article-body], .content article, .content') ||
+    doc.body;
 
-    const textIsMarker = (txt) => /our full .*running .*gloves .*reviews/i.test(txt);
-
-    // 1) найдём узел-маркер
-    let markerNode = null;
-    const allEls = root.querySelectorAll('*');
-    for (const el of allEls) {
-      const t = (el.textContent || '').trim();
-      if (t && textIsMarker(t)) { markerNode = el; break; }
-    }
-
-    // область поиска — от маркера вниз (или весь root)
-    let scope = root;
-    if (markerNode && markerNode.parentElement) scope = markerNode.parentElement;
-
-    // 2) ищем первую цену в области
-    const priceCandidates = Array.from(scope.querySelectorAll('*')).filter(n =>
-      /\$\s*\d{1,4}(?:[\.,]\d{2})?/.test((n.textContent || ''))
-    );
-    let priceText = '';
-    let anchorForMeta = null;
-    if (priceCandidates.length) {
-      const priceEl = priceCandidates[0];
-      priceText = (priceEl.textContent || '').match(/\$\s*\d{1,4}(?:[\.,]\d{2})?/)[0];
-      // поднимаемся к небольшому контейнеру (до 4 уровней), где есть заголовок/ссылка с названием
-      let up = priceEl;
-      for (let i = 0; i < 4 && up; i++) {
-        const hasHeading = up.querySelector && (up.querySelector('h1,h2,h3,h4,a,[data-hed],[data-title]'));
-        if (hasHeading) { anchorForMeta = up; break; }
-        up = up.parentElement;
-      }
-      if (!anchorForMeta) anchorForMeta = priceEl.parentElement || scope;
-    }
-
-    // 3) извлекаем название
-    let title = '';
-    if (anchorForMeta) {
-      const titleEl =
-        anchorForMeta.querySelector('h1,h2,h3,h4,[data-hed],[data-title]') ||
-        anchorForMeta.querySelector('a[title], a[aria-label]') ||
-        anchorForMeta.querySelector('a');
-
-      title = (titleEl && (titleEl.getAttribute?.('title') || titleEl.getAttribute?.('aria-label') || titleEl.textContent)) || '';
-      title = (title || '').replace(/\s+/g, ' ').trim();
-
-      // Если не нашли, возьмём самый длинный внутр. текст с "Glove"
-      if (!title || title.length < 8) {
-        const texts = Array.from(anchorForMeta.querySelectorAll('*'))
-          .map(n => (n.textContent || '').replace(/\s+/g, ' ').trim())
-          .filter(s => /glove/i.test(s));
-        if (texts.length) title = texts.sort((a,b)=>b.length-a.length)[0];
-      }
-    }
-
-    // 4) бейдж поблизости
-    let badge = '';
-    if (anchorForMeta) {
-      const nearText = (anchorForMeta.textContent || '').replace(/\s+/g, ' ');
-      const m = nearText.match(/\b(Best\s+(?:Overall|Budget|Value|for [^,.;]+)|Editor'?s Choice|Top Pick)\b/i);
-      badge = m ? m[0] : '';
-      // если не нашли — посмотри на 2 родителя вверх
-      if (!badge && anchorForMeta.parentElement) {
-        const upText = (anchorForMeta.parentElement.textContent || '').replace(/\s+/g, ' ');
-        const m2 = upText.match(/\b(Best\s+(?:Overall|Budget|Value|for [^,.;]+)|Editor'?s Choice|Top Pick)\b/i);
-        badge = m2 ? m2[0] : '';
-      }
-    }
-
-    if (!title && !priceText && !badge) return null;
-    return { badge: badge || '', title: title || '', price: priceText || '' };
-  } catch (e) {
-    console.log('extractFirstCardMeta failed:', e.message);
-    return null;
+  // маркер секции
+  let markerNode = null;
+  for (const el of root.querySelectorAll('*')) {
+    const t = (el.textContent || '').trim();
+    if (t && /our full .*running .*gloves .*reviews/i.test(t)) { markerNode = el; break; }
   }
+  let scope = markerNode?.parentElement || root;
+
+  // первая цена в области
+  const priceEl = Array.from(scope.querySelectorAll('*')).find(n => /\$\s*\d{1,4}(?:[\.,]\d{2})?/.test(n.textContent || ''));
+  const price = priceEl ? (priceEl.textContent.match(/\$\s*\d{1,4}(?:[\.,]\d{2})?/)[0]) : '';
+
+  // ближайший контейнер с заголовком
+  let anchor = priceEl;
+  for (let i = 0; i < 4 && anchor; i++) {
+    if (anchor.querySelector && anchor.querySelector('h1,h2,h3,h4,[data-hed],[data-title],a[title],a[aria-label]')) break;
+    anchor = anchor.parentElement;
+  }
+  anchor = anchor || priceEl?.parentElement || scope;
+
+  let title = '';
+  if (anchor) {
+    const tEl = anchor.querySelector('h1,h2,h3,h4,[data-hed],[data-title],a[title],a[aria-label],a');
+    title = (tEl && (tEl.getAttribute?.('title') || tEl.getAttribute?.('aria-label') || tEl.textContent)) || '';
+    title = (title || '').replace(/\s+/g, ' ').trim();
+    if (!title || title.length < 6) {
+      const texts = Array.from(anchor.querySelectorAll('*')).map(n => (n.textContent || '').replace(/\s+/g, ' ').trim());
+      const gloves = texts.filter(s => /glove/i.test(s));
+      if (gloves.length) title = gloves.sort((a,b)=>b.length-a.length)[0];
+    }
+  }
+
+  let badge = '';
+  if (anchor) {
+    const near = (anchor.textContent || '').replace(/\s+/g, ' ');
+    const m = near.match(/\b(Best\s+(?:Overall|Budget|Value|for [^,.;]+)|Editor'?s Choice|Top Pick)\b/i);
+    badge = m ? m[0] : '';
+    if (!badge && anchor.parentElement) {
+      const up = (anchor.parentElement.textContent || '').replace(/\s+/g, ' ');
+      const m2 = up.match(/\b(Best\s+(?:Overall|Budget|Value|for [^,.;]+)|Editor'?s Choice|Top Pick)\b/i);
+      badge = m2 ? m2[0] : '';
+    }
+  }
+
+  if (!title && !price && !badge) return null;
+  return { badge: badge || '', title: title || '', price: price || '' };
+}
+
+function extractFirstCardMeta_REGEX(rawHtml) {
+  // Плоский текст без тегов
+  const flat = rawHtml
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // от маркера вниз ~2000 символов
+  let from = flat.search(/our full .*running .*gloves .*reviews/i);
+  if (from < 0) from = 0;
+  const slice = flat.slice(from, from + 3000);
+
+  const badgeMatch = slice.match(/\b(Best\s+(?:Overall|Budget|Value|for [^,.;]+)|Editor'?s Choice|Top Pick)\b/i);
+  const badge = badgeMatch ? badgeMatch[0] : '';
+
+  // название: что-то «Glove(s)» или «The <Brand> <Model> ...»
+  let title = '';
+  const titleGlove = slice.match(/([A-Z][A-Za-z0-9'’\- ]+?\s+Gloves?)/);
+  if (titleGlove) title = titleGlove[1];
+  // поправка: если начинается с "The " — нормально, иначе ищем ближайшее к "Gloves"
+  if (!title || title.length < 6) {
+    const titleAlt = slice.match(/The\s+[A-Z][A-Za-z0-9'’\- ]{2,80}/);
+    if (titleAlt) title = titleAlt[0].trim();
+  }
+
+  const priceMatch = slice.match(/\$\s*\d{1,4}(?:[\.,]\d{2})?/);
+  const price = priceMatch ? priceMatch[0] : '';
+
+  if (!badge && !title && !price) return null;
+  return { badge: badge || '', title: title || '', price: price || '' };
 }
 
 function injectFirstCardHeaderIntoContent(contentHTML, meta) {
@@ -262,13 +268,9 @@ function injectFirstCardHeaderIntoContent(contentHTML, meta) {
 
     // Ищем маркер секции обзоров
     let markerEl = null;
-    const all = root.querySelectorAll('*');
-    for (const el of all) {
+    for (const el of root.querySelectorAll('*')) {
       const txt = (el.textContent || '').trim();
-      if (txt && /our full .*running .*gloves .*reviews/i.test(txt)) {
-        markerEl = el;
-        break;
-      }
+      if (txt && /our full .*running .*gloves .*reviews/i.test(txt)) { markerEl = el; break; }
     }
 
     // Если уже есть заголовок — не дублируем
@@ -357,9 +359,16 @@ app.get('/parse', async (req, res) => {
     // --- Восстановление шапки первой карточки ---
     if (ENABLE_CARD_HEADERS_RECOVERY) {
       try {
-        const meta = extractFirstCardMeta(fetched.body, url);
+        let meta = extractFirstCardMeta_DOM(fetched.body, url);
+        if (!meta) {
+          console.log('DOM meta not found, trying regex fallback…');
+          meta = extractFirstCardMeta_REGEX(fetched.body);
+        }
         if (meta) {
+          console.log('Recovered card meta:', JSON.stringify(meta));
           result.content = injectFirstCardHeaderIntoContent(result.content, meta);
+        } else {
+          console.log('Card meta not recovered.');
         }
       } catch (e) { console.log('Card header recovery failed:', e.message); }
     }
@@ -392,8 +401,8 @@ app.get('/parse', async (req, res) => {
         { selector: '.ad', format: 'skip' },
         { selector: '.advertisement', format: 'skip' },
         { selector: '.related-posts', format: 'skip' },
-        { selector: '.comments', format: 'skip' },
-        // НЕ скрываем карточки и гриды — иначе пропадут заголовки/цены/бейджи
+        { selector: '.comments', format: 'skip' }
+        // карточки/гриды не скрываем
       ],
     });
 
@@ -409,7 +418,7 @@ app.get('/parse', async (req, res) => {
         const hasBadge = /\b(Best|Top|Editor'?s Choice|Overall|Budget|Value|Pick)\b/i.test(line);
         if (hasPrice || hasBadge) return true;
 
-        // Вырубим только явные CTA без цены
+        // Убираем только явные CTA без цены
         if (/newsletter|subscribe|read article|leave a reply|your email address|previous post|next post|notifications/i.test(line)) return false;
         if (/(compare prices|shop the shoe|available at|buy now)/i.test(line) && !hasPrice) return false;
 
