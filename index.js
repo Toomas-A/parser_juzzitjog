@@ -4,6 +4,7 @@ const Parser = require('@postlight/parser');
 const { htmlToText } = require('html-to-text');
 const axios = require('axios');
 const fs = require('fs');
+const { buildContentTextV2 } = require('./lib/buildContentTextV2');
 
 // Fallback-парсер
 const { JSDOM } = require('jsdom');
@@ -418,8 +419,13 @@ app.get('/parse', async (req, res) => {
 
     console.log(`Content sample: ${finalContent.slice(0, 500)}`);
 
+    const content_text_v2 = result?.content
+      ? buildContentTextV2(result.content)
+      : "";
+
     return res.json({
       content: finalContent,
+      content_text_v2,
       title: result.title || 'N/A',
       author,
       fullResult: result,
